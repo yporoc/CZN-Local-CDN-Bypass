@@ -2,7 +2,6 @@ __pycache__/
 build/
 dist/
 *.spec
-czn_cdn.ini
 responder*
 czn_cdn.log
 czn_cdn.pid
