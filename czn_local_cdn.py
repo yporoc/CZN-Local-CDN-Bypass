@@ -35,6 +35,7 @@ REAL_HEADERS = {
 
 GAMERES = None
 log_callback = print    # 引擎日志出口，GUI 会替换成队列投递
+ACTIVE_IP = None        # 本次成功绑定的回环 IP（hosts 收敛目标）
 _MANIFEST = None
 _ETAGFILE = None
 
@@ -86,10 +87,14 @@ def load_body():
 
 
 # ---------------------------------------------------------------- hosts
-def hosts_install():
+def hosts_install(ip=None):
+    """收敛 hosts 到活动回环 IP：重写本工具标记行，只留当前 IP 这一条。"""
+    ip = ip or ACTIVE_IP or "127.0.0.1"
     txt = open(HOSTS, encoding="utf-8", errors="replace").read()
-    if DOMAIN in txt:
-        log_callback("[hosts] 条目已存在，跳过")
+    lines = txt.splitlines()
+    new_line = "%s %s %s" % (ip, DOMAIN, MARKER)
+    if any(l.strip() == new_line for l in lines):
+        log_callback("[hosts] 条目已指向 %s，跳过" % ip)
         return
     if not txt.endswith("\n"):
         txt += "\r\n"
@@ -97,9 +102,14 @@ def hosts_install():
     if not os.path.exists(bak):
         shutil.copyfile(HOSTS, bak)
         log_callback("[hosts] 原文件已备份: " + bak)
+    keep = [l for l in lines if MARKER not in l]
     open(HOSTS, "w", encoding="utf-8").write(
-        txt + "127.0.0.1 %s %s\r\n" % (DOMAIN, MARKER))
-    log_callback("[hosts] 条目已写入")
+        "\r\n".join(keep + [new_line]) + "\r\n")
+    old = [l.split()[0] for l in lines if MARKER in l]
+    if old:
+        log_callback("[hosts] 条目已更新: %s → %s" % ("、".join(old), ip))
+    else:
+        log_callback("[hosts] 条目已写入（%s）" % ip)
 
 
 def hosts_uninstall():
@@ -298,6 +308,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 class _Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
+    allow_reuse_address = False    # Windows 上 SO_REUSEADDR 等于允许端口劫持，不开
+
+    def server_bind(self):
+        # 独占绑定：其他进程无法再绑同一地址（含 SO_REUSEADDR 劫持者）
+        excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if excl is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, excl, 1)
+        return http.server.HTTPServer.server_bind(self)
 
     def handle_error(self, request, client_address):
         # TLS 握手失败不进 handler，必须在这里进日志，否则连接失败不可见
@@ -306,21 +324,65 @@ class _Server(http.server.ThreadingHTTPServer):
                      % (client_address[0], exc))
 
 
+_LOOPBACK_CANDIDATES = ["127.0.0.%d" % i for i in range(1, 21)]
+
+
 def make_server():
-    """绑定 0.0.0.0:PORT 并包装 TLS；失败返回 None。"""
+    """从 127.0.0.1 起逐个尝试回环 IP 的 443 端口；全部占用则点名占用者。"""
+    global ACTIVE_IP
     if not ensure_cert():
         return None
-    try:
-        srv = _Server(("0.0.0.0", PORT), _Handler)
-    except OSError as e:
-        log_callback("[server] 端口 %d 绑定失败: %s" % (PORT, e))
+    srv = None
+    for ip in _LOOPBACK_CANDIDATES:
+        try:
+            srv = _Server((ip, PORT), _Handler)
+            ACTIVE_IP = ip
+            break
+        except OSError:
+            log_callback("[srv] %s:%d 被占用，尝试下一个回环 IP…" % (ip, PORT))
+    if srv is None:
+        for pid, name in _port_occupiers():
+            log_callback("[srv] 占用者: %s (PID %s)" % (name, pid))
+        log_callback("[srv] ✘ 端口 %d 在所有回环 IP 上均被占用"
+                     " —— 请结束占用程序后重试" % PORT)
         return None
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-    log_callback("[srv] TLS 证书链已加载（叶子 CN=%s ← CA 指纹 %s…），监听 0.0.0.0:%d"
-                 % (DOMAIN, (cert_thumb() or "?")[:16], PORT))
+    log_callback("[srv] TLS 证书链已加载（叶子 CN=%s ← CA 指纹 %s…），监听 %s:%d"
+                 % (DOMAIN, (cert_thumb() or "?")[:16], ACTIVE_IP, PORT))
     return srv
+
+
+def _port_occupiers():
+    """反查本机 443 监听者，返回 [(pid, 进程名)]。"""
+    try:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True,
+                             timeout=15).stdout.decode("gbk", "replace")
+    except Exception:
+        return []
+    pids = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[3] == "LISTENING" and \
+                parts[1].endswith(":%d" % PORT):
+            pids.add(parts[4])
+    names = []
+    for pid in sorted(pids, key=lambda x: int(x) if x.isdigit() else 0):
+        name = "未知进程"
+        try:
+            t = subprocess.run(
+                ["tasklist", "/FI", "PID eq %s" % pid, "/FO", "CSV", "/NH"],
+                capture_output=True, timeout=15).stdout.decode("gbk", "replace")
+            row = [l for l in t.splitlines() if l.strip().startswith('"')]
+            if row:
+                name = row[0].split('","')[0].strip('"')
+        except Exception:
+            pass
+        if pid == "4":
+            name = "System（内核 HTTP.SYS —— IIS/WinRM 等）"
+        names.append((pid, name))
+    return names
 
 
 def manifest_path():
@@ -350,7 +412,7 @@ def _port_busy():
     s = socket.socket()
     s.settimeout(1)
     try:
-        s.bind(("0.0.0.0", PORT))
+        s.bind(("127.0.0.1", PORT))
         s.close()
         return False
     except OSError:

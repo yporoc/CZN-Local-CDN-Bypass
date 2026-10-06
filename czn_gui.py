@@ -282,7 +282,7 @@ class App(tk.Tk):
         if self.busy:
             s = "处理中…"
         elif self.server:
-            s = "运行中（端口 %d）—— 启动游戏即可" % engine.PORT
+            s = "运行中（%s:%d）—— 启动游戏即可" % (engine.ACTIVE_IP, engine.PORT)
         elif engine.GAMERES:
             s = "就绪，可启动服务"
         else:
@@ -345,25 +345,22 @@ class App(tk.Tk):
                 self.push_log("[srv] 清单: %s（%s 字节）  ETag: %s"
                               % (os.path.basename(engine.manifest_path()),
                                  format(size, ","), engine.current_etag()))
-                if engine.hosts_status():
-                    self.push_log("[hosts] 条目已存在，跳过")
-                else:
-                    engine.hosts_install()
+                # 先占端口再动系统：bind 失败则 hosts/CA 一概不碰，无半启动态
+                srv = engine.make_server()
+                if srv is None:
+                    return
+                engine.hosts_install()
                 if engine.cert_in_store():
                     self.push_log("[cert] CA 已在受信任根，跳过安装")
                 elif not engine.cert_install():
                     self.push_log("[!] CA 未装入 —— 游戏若报 TLS/网络错误多半因此"
                                    "（请以管理员运行本工具）")
-                srv = engine.make_server()
-                if srv is None:
-                    self.push_log("[srv] ✘ 端口 443 绑定失败"
-                                   "（是否已有实例或其他程序占用？）")
-                    return
                 self.server = srv
                 self.server_thread = threading.Thread(
                     target=srv.serve_forever, daemon=True, name="responder")
                 self.server_thread.start()
-                self.push_log("[srv] ✔ 应答器运行中 —— 现在启动游戏即可")
+                self.push_log("[srv] ✔ 应答器运行中 %s:%d —— 现在启动游戏即可"
+                              % (engine.ACTIVE_IP, engine.PORT))
             except Exception as e:
                 self.push_log("[!] 启动失败: %r" % e)
             finally:
